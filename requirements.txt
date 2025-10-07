@@ -1,0 +1,7 @@
+tempest>=31.0.0
+cinder-tempest-plugin>=1.5.0
+oslo.config>=9.0.0
+oslo.log>=5.0.0
+oslo.utils>=6.0.0
+requests>=2.25.1
+setuptools>=60.0.0

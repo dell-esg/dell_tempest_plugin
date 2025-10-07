@@ -1,0 +1,137 @@
+import logging
+
+from tempest import clients, config
+from tempest.common import credentials_factory, waiters
+from tempest.lib.common.utils import data_utils
+from tempest.lib.services.volume.v3.services_client import ServicesClient
+from cinder_tempest_plugin.api.volume import base as cinder_base
+
+from dell_tempest_plugin.services.failover_client import DellFailoverClient
+
+CONF = config.CONF
+LOG = logging.getLogger(__name__)
+LOG.info("Tempest config loaded from: %s", CONF.config_file)
+
+
+class BaseTempestTest(cinder_base.BaseVolumeTest):
+    backend_name = None
+    backend_id = None
+
+    @classmethod
+    def setup_clients(cls):
+        super(BaseTempestTest, cls).setup_clients()
+
+        # Get admin credentials and initialize admin manager
+        admin_creds = credentials_factory.get_configured_admin_credentials()
+        cls.admin_manager = clients.Manager(credentials=admin_creds)
+
+        # Explicitly initialize volume_services_client
+        cls.volume_services_client = ServicesClient(
+            auth_provider=cls.admin_manager.auth_provider,
+            service='volume',
+            region=CONF.identity.region,
+            endpoint_type=CONF.volume.endpoint_type,
+            build_interval=CONF.volume.build_interval,
+            build_timeout=CONF.volume.build_timeout
+        )
+
+        # Initialize custom failover client
+        cls.failover_client = DellFailoverClient(
+            auth_provider=cls.admin_manager.auth_provider,
+            service='block-storage',
+            region=CONF.identity.region,
+            endpoint_type=CONF.volume.endpoint_type,
+            build_interval=CONF.volume.build_interval,
+            build_timeout=CONF.volume.build_timeout
+        )
+
+    @classmethod
+    def skip_checks(cls):
+        super(BaseTempestTest, cls).skip_checks()
+        if not getattr(CONF.volume_feature_enabled, 'replication', False):
+            raise cls.skipException("Replication not enabled")
+
+    def discover_host_name(self):
+        try:
+            services = self.volume_services_client.list_services()['services']
+            for svc in services:
+                if svc['binary'] == 'cinder-volume' and self.backend_name in svc['host']:
+                    return svc['host']
+        except Exception as e:
+            self.fail(f"Failed to discover volume host for failover: {e}")
+        self.fail(f"No matching host found for backend: {self.backend_name}")
+
+    def safe_delete_volume(self, volume_id):
+        try:
+            volume = self.volumes_client.show_volume(volume_id)['volume']
+            deletable_states = ['available',
+                                'error',
+                                'error_restoring',
+                                'error_extending',
+                                'error_managing']
+            if volume['status'] in deletable_states:
+                self.volumes_client.delete_volume(volume_id)
+                waiters.wait_for_volume_resource_status(self.volumes_client,
+                                                        volume_id,
+                                                        'deleted')
+            else:
+                LOG.warning("Skipping deletion of volume %s due to non-deletable status: %s",
+                            volume_id, volume['status'])
+        except Exception as e:
+            LOG.error("Exception during volume cleanup for %s: %s",
+                      volume_id, str(e))
+
+    def _run_failover_test(self):
+        volume_name = data_utils.rand_name(f"{self.backend_name}-volume")
+
+        try:
+            volume = self.create_volume(name=volume_name, replication=True)
+        except Exception as e:
+            self.fail(f"Failed to create volume with replication: {e}")
+
+        self.assertIsNotNone(volume,
+                             "create_volume returned None")
+        self.assertIn('id',
+                      volume,
+                      "Created volume does not have an 'id'")
+        self.assertTrue(volume.get('id'),
+                        "Volume ID is empty or missing")
+
+        waiters.wait_for_volume_resource_status(self.volumes_client,
+                                                volume['id'],
+                                                'available')
+        volume = self.volumes_client.show_volume(volume['id'])['volume']
+
+        self.addCleanup(self.safe_delete_volume,
+                        volume['id'])
+
+        if volume['status'] != 'available':
+            self.fail(f"Volume not in 'available' state after creation: {volume['status']}")
+
+        LOG.info("Created volume %s with replication", volume['id'])
+
+        host_name = self.discover_host_name()
+
+        try:
+            LOG.info("Triggering failover for host: %s with backend: %s",
+                     host_name, self.backend_id)
+            self.failover_client.failover_host(host_name,
+                                               backend_id=self.backend_id)
+        except Exception as e:
+            self.fail(f"Failover operation failed: {e}")
+
+        try:
+            volume_details = self.volumes_client.show_volume(volume['id'])['volume']
+            LOG.info("Volume details after failover: %s", volume_details)
+        except Exception as e:
+            self.fail(f"Failed to fetch volume details after failover: {e}")
+
+        self.assertEqual(volume_details['status'],
+                         'available',
+                         f"Volume not available after failover: {volume_details['status']}")
+        self.assertIn('replication_status',
+                      volume_details,
+                      "Missing replication_status in volume details")
+        self.assertEqual(volume_details['replication_status'],
+                         'failed-over',
+                         f"Unexpected replication_status: {volume_details['replication_status']}")
