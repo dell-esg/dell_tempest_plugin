@@ -1,6 +1,9 @@
+import os
 from oslo_config import cfg
-from dell_tempest_plugin.services.failover_client import DellFailoverClient
 from tempest.test_discover import plugins
+import logging
+
+LOG = logging.getLogger(__name__)
 
 # Define plugin-specific config options
 powerstore_opts = [
@@ -38,10 +41,13 @@ class DellTempestPlugin(plugins.TempestPlugin):
 
 
     def load_tests(self):
+        
+        LOG.info("DellTempestPlugin: load_tests() called")
+        LOG.info(f"Returning test_dir and top_path: {os.path.dirname(__file__)}")
+
         return (
-            'dell_tempest_plugin.tests',
-            'dell_tempest_plugin.tests.api',
-            'dell_tempest_plugin.tests.scenario',
+            'dell_tempest_plugin.tests',  # Base directory for tests
+            os.path.dirname(__file__)     # Plugin root path
         )
 
 
