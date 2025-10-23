@@ -1,9 +1,6 @@
 import os
 from oslo_config import cfg
 from tempest.test_discover import plugins
-import logging
-
-LOG = logging.getLogger(__name__)
 
 # Define plugin-specific config options
 powerstore_opts = [
@@ -35,20 +32,28 @@ class DellTempestPlugin(plugins.TempestPlugin):
 
     def get_tests_dirs(self):
         return ['dell_tempest_plugin/tests']
+    
+    
+    def get_test_paths():
+        driver = os.getenv('DELL_DRIVER', 'all')
+        base_path = os.path.dirname(__file__)
+        if driver == 'powerstore':
+            return [os.path.join(base_path, 'tests', 'powerstore')]
+        elif driver == 'powerflex':
+            return [os.path.join(base_path, 'tests', 'powerflex')]
+        else:
+            return [os.path.join(base_path, 'tests')]
 
     def get_tempest_plugins(self):
         return []
 
 
     def load_tests(self):
-        
-        LOG.info("DellTempestPlugin: load_tests() called")
-        LOG.info(f"Returning test_dir and top_path: {os.path.dirname(__file__)}")
-
-        return (
-            'dell_tempest_plugin.tests',  # Base directory for tests
-            os.path.dirname(__file__)     # Plugin root path
-        )
+        base_path = os.path.split(os.path.dirname(
+            os.path.abspath(__file__)))[0]
+        test_dir = "dell_tempest_plugin"
+        full_test_dir = os.path.join(base_path, test_dir)
+        return full_test_dir, base_path
 
 
     def get_metadata(self):
