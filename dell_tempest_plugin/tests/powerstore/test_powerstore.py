@@ -1,6 +1,5 @@
 import logging
-import dell_tempest_plugin.tests.api.test_dell_base as dell_base
-import uuid
+import dell_tempest_plugin.tests.base.test_dell_base as dell_base
 from tempest.lib import decorators
 
 LOG = logging.getLogger(__name__)

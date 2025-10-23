@@ -9,7 +9,7 @@ setup(
     include_package_data=True,
     entry_points={
         'tempest.test_plugins': [
-            'dell_tempest_plugin = dell_tempest_plugin.plugin:DellTempestPlugin'
+            'dell-tempest-plugin = dell_tempest_plugin.plugin:DellTempestPlugin'
         ]
     }
 )
