@@ -1,22 +1,25 @@
 import logging
 
+from cinder_tempest_plugin.api.volume import base as cinder_base
+from dell_tempest_plugin.services.failover_client import DellFailoverClient
 from tempest import clients, config
 from tempest.common import credentials_factory, waiters
 from tempest.lib.common.utils import data_utils
+from tempest.lib import exceptions
 from tempest.lib.services.volume.v3.services_client import ServicesClient
-from cinder_tempest_plugin.api.volume import base as cinder_base
+from tempest.lib.services.volume.v3.types_client import TypesClient
+from tempest.lib.services.volume.v3.volumes_client import VolumesClient
 
-from dell_tempest_plugin.services.failover_client import DellFailoverClient
 
 CONF = config.CONF
 LOG = logging.getLogger(__name__)
-LOG.info("Tempest config loaded from: %s", CONF.config_file)
+LOG.info("CONF.volume_feature_enabled.volume_types = %s", CONF.volume_feature_enabled.volume_types)
 
 
 class BaseTempestTest(cinder_base.BaseVolumeTest):
     backend_name = None
     backend_id = None
-
+    
     @classmethod
     def setup_clients(cls):
         super(BaseTempestTest, cls).setup_clients()
@@ -24,6 +27,25 @@ class BaseTempestTest(cinder_base.BaseVolumeTest):
         # Get admin credentials and initialize admin manager
         admin_creds = credentials_factory.get_configured_admin_credentials()
         cls.admin_manager = clients.Manager(credentials=admin_creds)
+        
+        
+        cls.volume_types_client = TypesClient(
+            auth_provider=cls.admin_manager.auth_provider,
+            service='block-storage',  # <-- this must match catalog_type
+            region=CONF.identity.region,
+            endpoint_type=CONF.volume.endpoint_type,
+            build_interval=CONF.volume.build_interval,
+            build_timeout=CONF.volume.build_timeout
+        )
+        
+        cls.volumes_client = VolumesClient(
+            auth_provider=cls.admin_manager.auth_provider,
+            service='block-storage',
+            region=CONF.identity.region,
+            endpoint_type=CONF.volume.endpoint_type,
+            build_interval=CONF.volume.build_interval,
+            build_timeout=CONF.volume.build_timeout
+        )
 
         # Explicitly initialize volume_services_client
         cls.volume_services_client = ServicesClient(
@@ -135,3 +157,63 @@ class BaseTempestTest(cinder_base.BaseVolumeTest):
         self.assertEqual(volume_details['replication_status'],
                          'failed-over',
                          f"Unexpected replication_status: {volume_details['replication_status']}")
+    
+    #@decorators.idempotent_id('a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+    def _run_create_volume_with_volume_type(self):
+        if not getattr(CONF.volume_feature_enabled, 'volume_types', False):
+            raise self.skipException("Volume types are not enabled")
+
+        # Step 1: Create volume type
+        volume_type_name = data_utils.rand_name("powerflex_limit_iops")
+        volume_type = self.volume_types_client.create_volume_type(
+            name=volume_type_name,
+            extra_specs={
+                "volume_backend_name": "powerflex1",
+                "powerflex:storage_pool_name": "SP1",
+                "powerflex:protection_domain_name": "PD1",
+                "provisioning:type": "thin",
+                "powerflex:iops_limit": "5000"
+            }
+        )['volume_type']
+
+        self.assertEqual(volume_type['name'], volume_type_name)
+        self.assertTrue(volume_type['is_public'])
+        self.assertIn("volume_backend_name", volume_type['extra_specs'])
+        self.assertEqual(volume_type['extra_specs']['volume_backend_name'], "powerflex1")
+
+        # Step 2: Create volume using the volume type
+        volume_name = data_utils.rand_name("powerflex_volume")
+        volume = self.volumes_client.create_volume(
+            size=8,
+            volume_type=volume_type_name,
+            name=volume_name
+        )['volume']
+
+        # Wait for volume to become available        
+        waiters.wait_for_volume_resource_status(
+            self.volumes_client,
+            volume['id'],
+            'available'
+        )
+
+        # Validate volume properties
+        volume_details = self.volumes_client.show_volume(volume['id'])['volume']
+        self.assertEqual(volume_details['name'], volume_name)
+        self.assertEqual(volume_details['volume_type'], volume_type_name)
+        self.assertEqual(volume_details['size'], 8)
+
+        # Step 3: Cleanup volume and wait for deletion
+        self.volumes_client.delete_volume(volume['id'])
+        
+        try:
+            waiters.wait_for_volume_resource_status(
+                self.volumes_client,
+                volume['id'],
+                'deleted'
+            )
+        except exceptions.NotFound:
+            # Volume is already deleted, which is acceptable
+            pass
+
+        # Step 4: Cleanup volume type
+        self.volume_types_client.delete_volume_type(volume_type['id'])
