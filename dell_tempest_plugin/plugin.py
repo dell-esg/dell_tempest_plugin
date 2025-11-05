@@ -3,21 +3,34 @@ from oslo_config import cfg
 from tempest.test_discover import plugins
 
 # Define plugin-specific config options
-powerstore_opts = [
+volume_opts = [
     cfg.BoolOpt('replication',
                 default=True,
                 help='Enable replication tests for PowerStore'),
+    cfg.BoolOpt('volume_types',
+                default=True,
+                help='Enable volume type tests'),
 ]
 
 class DellTempestPlugin(plugins.TempestPlugin):
 
     def get_opt_lists(self):
-        # Register options under the 'powerstore' group
+        # Register options under the 'powerstore' group        
         return [
-            ('volume', cfg.CONF.volume),
-            ('volume-feature-enabled', powerstore_opts),
-            ]
-
+                    ('service_available', [
+                        cfg.BoolOpt('cinder', default=True,
+                                    help='Whether or not cinder is expected to be available'),
+                    ]),
+                    ('volume-feature-enabled', volume_opts),
+                    ('volume', [
+                        cfg.StrOpt('catalog_type', default='block-storage',
+                                help='Catalog type of the Volume service'),
+                        cfg.StrOpt('endpoint_type', default='public',
+                                help='Endpoint type to use for the Volume service'),
+                        cfg.StrOpt('region', default='RegionOne',
+                                help='Region for the Volume service endpoint'),
+                    ]),
+                ]
 
     def get_service_clients(self):
         return [
@@ -65,4 +78,4 @@ class DellTempestPlugin(plugins.TempestPlugin):
 
 
     def register_opts(self, conf):
-        conf.register_opts(powerstore_opts, group='volume-feature-enabled')
+        conf.register_opts(volume_opts, group='volume-feature-enabled')
