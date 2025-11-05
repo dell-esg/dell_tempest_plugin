@@ -15,3 +15,12 @@ class PowerflexTempestTest(dell_base.BaseTempestTest):
         if not getattr(dell_base.CONF.volume_feature_enabled, 'volume_types', False):
             raise self.skipException("Volume types are not enabled")
         self._run_create_volume_with_volume_type()
+    
+    @decorators.idempotent_id('b2c3d4e5-f6a7-8901-bcde-fa2345678901')
+    def test_create_volume_with_qos_spec(self):
+        LOG.info("Executing: PowerflexTempestTest.test_create_volume_with_qos_spec")
+
+        if not getattr(dell_base.CONF.volume_feature_enabled, 'volume_types', False):
+            raise self.skipException("Volume types are not enabled")
+
+        self._run_create_volume_with_qos_spec()
