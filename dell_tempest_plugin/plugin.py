@@ -1,6 +1,8 @@
 import os
+import logging
 from oslo_config import cfg
 from tempest.test_discover import plugins
+LOG = logging.getLogger(__name__)
 
 # Define plugin-specific config options
 volume_opts = [
@@ -49,6 +51,7 @@ class DellTempestPlugin(plugins.TempestPlugin):
     
     def get_test_paths(self):
         driver = os.getenv('DELL_DRIVER', 'all')
+        LOG.info(f"DELL_DRIVER in plugin: {driver}")
         base_path = os.path.dirname(os.path.abspath(__file__))
 
         if driver == 'powerstore':
@@ -66,6 +69,7 @@ class DellTempestPlugin(plugins.TempestPlugin):
         base_path = os.path.split(os.path.dirname(os.path.abspath(__file__)))[0]
         test_dir = "dell_tempest_plugin"
         driver = os.getenv('DELL_DRIVER', 'all')
+        LOG.info(f"DELL_DRIVER in plugin: {driver}")
 
         if driver == 'powerstore':
             full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerstore')
