@@ -53,7 +53,6 @@ class DellTempestPlugin(plugins.TempestPlugin):
     
     def get_test_paths(self):
         CONF = cfg.CONF
-        LOG.info(f"Available config sections: {CONF.list_all_sections()}")
         driver = CONF.dell_driver.driver
         LOG.info(f"DELL_DRIVER in plugin: {driver}")
 
