@@ -13,3 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_config import cfg
+
+dell_driver_opts = [
+    cfg.StrOpt('driver', default='all', help='Active Dell driver to test')
+]
+
+CONF = cfg.CONF
+CONF.register_opts(dell_driver_opts, group='dell_driver')
