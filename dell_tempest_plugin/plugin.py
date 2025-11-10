@@ -47,9 +47,10 @@ class DellTempestPlugin(plugins.TempestPlugin):
         return ['dell_tempest_plugin/tests']
     
     
-    def get_test_paths():
+    def get_test_paths(self):
         driver = os.getenv('DELL_DRIVER', 'all')
-        base_path = os.path.dirname(__file__)
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
         if driver == 'powerstore':
             return [os.path.join(base_path, 'tests', 'powerstore')]
         elif driver == 'powerflex':
@@ -62,10 +63,17 @@ class DellTempestPlugin(plugins.TempestPlugin):
 
 
     def load_tests(self):
-        base_path = os.path.split(os.path.dirname(
-            os.path.abspath(__file__)))[0]
+        base_path = os.path.split(os.path.dirname(os.path.abspath(__file__)))[0]
         test_dir = "dell_tempest_plugin"
-        full_test_dir = os.path.join(base_path, test_dir)
+        driver = os.getenv('DELL_DRIVER', 'all')
+
+        if driver == 'powerstore':
+            full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerstore')
+        elif driver == 'powerflex':
+            full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerflex')
+        else:
+            full_test_dir = os.path.join(base_path, test_dir, 'tests')
+
         return full_test_dir, base_path
 
 
