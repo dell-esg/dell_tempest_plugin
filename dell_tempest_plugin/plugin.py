@@ -48,7 +48,6 @@ class DellTempestPlugin(plugins.TempestPlugin):
     
     
     def get_test_paths(self):
-        import os
         driver = os.getenv('DELL_DRIVER', 'all')
         base_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,7 +63,6 @@ class DellTempestPlugin(plugins.TempestPlugin):
 
 
     def load_tests(self):
-        import os
         base_path = os.path.split(os.path.dirname(os.path.abspath(__file__)))[0]
         test_dir = "dell_tempest_plugin"
         driver = os.getenv('DELL_DRIVER', 'all')
