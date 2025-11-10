@@ -2,6 +2,7 @@ import os
 import logging
 from oslo_config import cfg
 from tempest.test_discover import plugins
+from dell_tempest_plugin import config
 
 # Define plugin-specific config options
 volume_opts = [
@@ -12,6 +13,8 @@ volume_opts = [
                 default=True,
                 help='Enable volume type tests'),
 ]
+
+LOG = logging.getLogger(__name__)
 
 class DellTempestPlugin(plugins.TempestPlugin):
 
@@ -49,11 +52,9 @@ class DellTempestPlugin(plugins.TempestPlugin):
     
     
     def get_test_paths(self):
-        from tempest import config
-        CONF = config.CONF
-
-        driver = getattr(CONF, 'dell_driver', 'all')
-        LOG = logging.getLogger(__name__)
+        CONF = cfg.CONF
+        LOG.info(f"Available config sections: {CONF.list_all_sections()}")
+        driver = CONF.dell_driver.driver
         LOG.info(f"DELL_DRIVER in plugin: {driver}")
 
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -73,12 +74,8 @@ class DellTempestPlugin(plugins.TempestPlugin):
         base_path = os.path.split(os.path.dirname(os.path.abspath(__file__)))[0]
         test_dir = "dell_tempest_plugin"
         
-        from tempest import config
-        CONF = config.CONF
-
-        driver = getattr(CONF, 'dell_driver', 'all')
-       
-        LOG = logging.getLogger(__name__)
+        CONF = cfg.CONF
+        driver = CONF.dell_driver.driver
         LOG.info(f"DELL_DRIVER in plugin: {driver}")
 
 
