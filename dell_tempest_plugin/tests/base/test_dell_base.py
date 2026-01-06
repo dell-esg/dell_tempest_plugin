@@ -21,58 +21,60 @@ class BaseTempestTest(cinder_base.BaseVolumeTest):
     backend_name = None
     backend_id = None
     
-    @classmethod
+    @classmethod    
     def setup_clients(cls):
         super(BaseTempestTest, cls).setup_clients()
 
-        # Get admin credentials and initialize admin manager
         admin_creds = credentials_factory.get_configured_admin_credentials()
         cls.admin_manager = clients.Manager(credentials=admin_creds)
-        
-        
+
+        # Use CONF.volume.catalog_type consistently (e.g., 'volumev3' or 'block-storage')
+        service_type = CONF.volume.catalog_type
+        region = CONF.volume.region or CONF.identity.region
+        endpoint_type = CONF.volume.endpoint_type
+
         cls.volume_types_client = TypesClient(
             auth_provider=cls.admin_manager.auth_provider,
-            service='block-storage',  # <-- this must match catalog_type
-            region=CONF.identity.region,
-            endpoint_type=CONF.volume.endpoint_type,
+            service=service_type,
+            region=region,
+            endpoint_type=endpoint_type,
             build_interval=CONF.volume.build_interval,
             build_timeout=CONF.volume.build_timeout
         )
-        
+
         cls.qos_client = QosSpecsClient(
-                auth_provider=cls.admin_manager.auth_provider,
-                service=CONF.volume.catalog_type,
-                region=CONF.volume.region or CONF.identity.region
-            )
-           
+            auth_provider=cls.admin_manager.auth_provider,
+            service=service_type,
+            region=region
+        )
+
         cls.volumes_client = VolumesClient(
             auth_provider=cls.admin_manager.auth_provider,
-            service='block-storage',
-            region=CONF.identity.region,
-            endpoint_type=CONF.volume.endpoint_type,
+            service=service_type,
+            region=region,
+            endpoint_type=endpoint_type,
             build_interval=CONF.volume.build_interval,
             build_timeout=CONF.volume.build_timeout
         )
 
-        # Explicitly initialize volume_services_client
         cls.volume_services_client = ServicesClient(
             auth_provider=cls.admin_manager.auth_provider,
-            service='volume',
-            region=CONF.identity.region,
-            endpoint_type=CONF.volume.endpoint_type,
+            service=service_type,  # <-- Was 'volume'; use catalog_type instead
+            region=region,
+            endpoint_type=endpoint_type,
             build_interval=CONF.volume.build_interval,
             build_timeout=CONF.volume.build_timeout
         )
 
-        # Initialize custom failover client
         cls.failover_client = DellFailoverClient(
             auth_provider=cls.admin_manager.auth_provider,
-            service='block-storage',
-            region=CONF.identity.region,
-            endpoint_type=CONF.volume.endpoint_type,
+            service=service_type,
+            region=region,
+            endpoint_type=endpoint_type,
             build_interval=CONF.volume.build_interval,
             build_timeout=CONF.volume.build_timeout
         )
+
 
     @classmethod
     def skip_checks(cls):
