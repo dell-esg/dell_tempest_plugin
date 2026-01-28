@@ -1,0 +1,24 @@
+# nonk8s
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: dell-emc-openstack-manila
+  description: "Dell Openstack Manila drivers"
+  tags:
+    - PowerMax
+    - PowerStore
+    - PowerFlex
+    - PowerScale
+    - Unity
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    github.com/openstack: manila/tree/master/manila/share/drivers/dell_emc
+  links:
+    - url: 'https://github.com/openstack/manila/tree/master/manila/share/drivers/dell_emc'
+      title: 'Dell Manila drivers'
+      icon: 'web'
+spec:
+  type: service
+  lifecycle: production
+  owner: user:default/prasant.padhi@dell.com
+  visibility: all
