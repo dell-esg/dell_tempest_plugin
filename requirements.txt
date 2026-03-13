@@ -1,5 +1,6 @@
 tempest>=31.0.0
 cinder-tempest-plugin>=1.5.0
+manila-tempest-plugin>=0.5.0
 oslo.config>=9.0.0
 oslo.log>=5.0.0
 oslo.utils>=6.0.0

@@ -24,6 +24,8 @@ class DellTempestPlugin(plugins.TempestPlugin):
                     ('service_available', [
                         cfg.BoolOpt('cinder', default=True,
                                     help='Whether or not cinder is expected to be available'),
+                        cfg.BoolOpt('manila', default=True,
+                                    help='Whether or not manila is expected to be available'),
                     ]),
                     ('volume-feature-enabled', volume_opts),
                     ('volume', [
@@ -62,6 +64,8 @@ class DellTempestPlugin(plugins.TempestPlugin):
             return [os.path.join(base_path, 'tests', 'powerstore')]
         elif driver == 'powerflex':
             return [os.path.join(base_path, 'tests', 'powerflex')]
+        elif driver == 'powerscale':
+            return [os.path.join(base_path, 'tests', 'powerscale')]
         else:
             return [os.path.join(base_path, 'tests')]
 
@@ -82,6 +86,8 @@ class DellTempestPlugin(plugins.TempestPlugin):
             full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerstore')
         elif driver == 'powerflex':
             full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerflex')
+        elif driver == 'powerscale':
+            full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerscale')
         else:
             full_test_dir = os.path.join(base_path, test_dir, 'tests')
 
