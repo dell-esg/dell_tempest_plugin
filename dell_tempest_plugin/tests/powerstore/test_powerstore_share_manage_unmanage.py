@@ -285,7 +285,8 @@ class PowerStoreShareManageUnmanageBase(object):
                 share_type_id=share_type_name,
                 name=name,
             )
-        except (lib_exc.BadRequest, lib_exc.ServerFault) as e:
+        except (lib_exc.BadRequest, lib_exc.ServerFault,
+                lib_exc.Conflict) as e:
             LOG.info("Manage correctly rejected by API: %s", e)
             return None
 
