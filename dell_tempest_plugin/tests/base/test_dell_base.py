@@ -14,7 +14,6 @@ from tempest.lib.services.volume.v3.qos_client import QosSpecsClient
 
 CONF = config.CONF
 LOG = logging.getLogger(__name__)
-LOG.info("CONF.volume_feature_enabled.volume_types = %s", CONF.volume_feature_enabled.volume_types)
 
 
 class BaseTempestTest(cinder_base.BaseVolumeTest):
