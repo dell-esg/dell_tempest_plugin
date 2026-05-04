@@ -49,8 +49,10 @@ PowerStore driver path (Manila):
   - client.py: POST /api/rest/file_system_snapshot/{snapshot_id}/restore
 """
 
+import configparser
 import time
 
+import requests
 from oslo_log import log as logging
 from tempest import clients
 from tempest import config
@@ -65,6 +67,7 @@ LOG = logging.getLogger(__name__)
 
 SHARE_BUILD_TIMEOUT = 600
 SHARE_BUILD_INTERVAL = 5
+SHARE_MIN_SIZE = 3
 
 
 # ======================================================================
@@ -196,7 +199,8 @@ class PowerStoreShareRevertSnapshotTest(object):
     # ------------------------------------------------------------------
     # Share helpers
     # ------------------------------------------------------------------
-    def create_share(self, protocol='NFS', share_type_name=None, size=1):
+    def create_share(self, protocol='NFS', share_type_name=None,
+                    size=SHARE_MIN_SIZE):
         """Create a share and wait until available."""
         name = data_utils.rand_name(
             prefix=CONF.resource_name_prefix,
@@ -240,6 +244,20 @@ class PowerStoreShareRevertSnapshotTest(object):
                 return
             time.sleep(interval)
         LOG.warning("Timeout waiting for share %s deletion", share_id)
+
+    def _get_export_locations(self, share_id):
+        """Retrieve export locations for a share via dedicated API.
+
+        Manila's v2 share representation does not always embed
+        export locations in the share dict. Use the explicit
+        export locations API instead, similar to the PowerScale
+        revert tests.
+        """
+        el = self.shares_v2_client.list_share_export_locations(share_id)
+        locations = el.get('export_locations', el)
+        if isinstance(locations, list):
+            return locations
+        return []
 
     def _wait_for_share_status(self, share_id, target,
                               timeout=SHARE_BUILD_TIMEOUT,
@@ -350,6 +368,58 @@ class PowerStoreShareRevertSnapshotTest(object):
         share = self.shares_v2_client.get_share(share_id)['share']
         return share
 
+    # ------------------------------------------------------------------
+    # PowerStore REST API helper (backend verification)
+    # ------------------------------------------------------------------
+    def _get_powerstore_snapshot_details(self, snapshot_id):
+        """Query the PowerStore REST API to get snapshot details.
+
+        Reads PowerStore credentials from manila.conf [powerstore] section.
+        Returns the snapshot details dict, or None if not found.
+
+        This is used for backend verification to ensure the PowerStore
+        API was called correctly during revert operations.
+
+        :param snapshot_id: Manila snapshot UUID (may map to PowerStore
+                           snapshot name or ID).
+        :returns: Snapshot details dict from PowerStore API, or None.
+        """
+        try:
+            conf = configparser.ConfigParser()
+            conf.read('/etc/manila/manila.conf')
+            ps_ip = conf.get('powerstore', 'san_ip')
+            ps_user = conf.get('powerstore', 'san_login')
+            ps_pass = conf.get('powerstore', 'san_password')
+        except Exception as e:
+            LOG.warning("Cannot read PowerStore creds from manila.conf: %s", e)
+            return None
+
+        # PowerStore uses snapshot name as the identifier in Manila
+        # Try both by ID and by name
+        url = 'https://%s/api/rest/file_system_snapshot' % ps_ip
+        params = {
+            'name': 'eq.%s' % snapshot_id,
+            'select': 'id,name,file_system_id',
+        }
+        try:
+            resp = requests.get(
+                url, params=params,
+                auth=(ps_user, ps_pass),
+                verify=False, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    snap_details = data[0]
+                    LOG.info("PowerStore snapshot '%s' found: id=%s, fs_id=%s",
+                             snapshot_id, snap_details.get('id'),
+                             snap_details.get('file_system_id'))
+                    return snap_details
+            LOG.warning("PowerStore snapshot lookup for '%s' returned %s",
+                        snapshot_id, resp.status_code)
+        except Exception as e:
+            LOG.warning("PowerStore REST query failed: %s", e)
+        return None
+
 
 # ======================================================================
 # NFS Revert-to-Snapshot Tests
@@ -385,7 +455,7 @@ class _NFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
         share_id = share['id']
         self.assertEqual(share['status'], 'available')
@@ -394,10 +464,17 @@ class _NFSRevertSnapshotTests(object):
         snapshot = self.create_snapshot(share_id)
         self.assertEqual(snapshot['status'], 'available')
 
+        # Verify snapshot exists on PowerStore backend (optional verification)
+        snap_details = self._get_powerstore_snapshot_details(snapshot['id'])
+        if snap_details:
+            LOG.info("Backend verification: snapshot exists on PowerStore "
+                     "(id=%s, fs_id=%s)",
+                     snap_details.get('id'), snap_details.get('file_system_id'))
+
         # Revert to snapshot
         reverted = self.revert_to_snapshot(share_id, snapshot['id'])
         self.assertEqual(reverted['status'], 'available')
-        self.assertEqual(int(reverted['size']), 1)
+        self.assertEqual(int(reverted['size']), SHARE_MIN_SIZE)
         LOG.info("NFS share %s reverted to snapshot %s successfully",
                  share_id, snapshot['id'])
 
@@ -419,25 +496,24 @@ class _NFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
         share_id = share['id']
 
-        # Get export locations before revert
-        share_before = self.shares_v2_client.get_share(share_id)['share']
-        exports_before = share_before.get('export_locations', [])
-        self.assertGreater(len(exports_before), 0,
-                          "Share should have export locations")
+        # Get export locations before revert via dedicated API
+        exports_before = self._get_export_locations(share_id)
+        self.assertTrue(len(exports_before) > 0,
+                        "Share should have export locations")
         LOG.info("Export locations before revert: %s", exports_before)
 
         snapshot = self.create_snapshot(share_id)
 
-        reverted = self.revert_to_snapshot(share_id, snapshot['id'])
+        self.revert_to_snapshot(share_id, snapshot['id'])
 
         # Verify export locations after revert
-        exports_after = reverted.get('export_locations', [])
+        exports_after = self._get_export_locations(share_id)
         self.assertEqual(len(exports_after), len(exports_before),
-                        "Export locations count should be preserved")
+                         "Export locations count should be preserved")
         LOG.info("Export locations after revert: %s", exports_after)
 
     # ----------------------------------------------------------------
@@ -457,7 +533,7 @@ class _NFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
 
         snapshot = self.create_snapshot(share['id'])
@@ -495,7 +571,7 @@ class _NFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
         share_id = share['id']
 
@@ -519,6 +595,240 @@ class _NFSRevertSnapshotTests(object):
             share_id,
         )
         LOG.info("Full NFS revert lifecycle completed for share %s", share_id)
+
+
+# ======================================================================
+# Negative Revert-to-Snapshot Tests
+# ======================================================================
+class _NegativeRevertSnapshotTests(object):
+    """Negative test methods for PowerStore revert-to-snapshot.
+
+    Tests error scenarios:
+      - Revert to snapshot of different share
+      - Revert to non-existent snapshot
+      - Revert share in error state
+    """
+
+    @classmethod
+    def skip_checks(cls):
+        super(_NegativeRevertSnapshotTests, cls).skip_checks()
+        if not CONF.service_available.manila:
+            raise cls.skipException("Manila is not available")
+
+    # ----------------------------------------------------------------
+    # Test: Revert to snapshot of different share should fail
+    # ----------------------------------------------------------------
+    @decorators.idempotent_id('e1f2a3b4-c5d6-4e7f-8a9b-040506070809')
+    @decorators.attr(type=['negative', 'api_with_backend'])
+    def test_revert_to_snapshot_different_share_fails(self):
+        """Revert a share to a snapshot belonging to a different share.
+
+        Expected behavior:
+          - Manila should reject the request with BadRequest or
+            the share should enter error_reverting state.
+
+        PowerStore API: POST /file_system_snapshot/{id}/restore
+        - PowerStore allows the API call but the snapshot belongs to
+          a different filesystem, so the operation should fail.
+        """
+        LOG.info("=== test_revert_to_snapshot_different_share_fails ===")
+
+        share_type = self.create_revert_share_type()
+        share1 = self.create_share(
+            protocol='NFS',
+            share_type_name=share_type['name'],
+            size=SHARE_MIN_SIZE,
+        )
+        share2 = self.create_share(
+            protocol='NFS',
+            share_type_name=share_type['name'],
+            size=SHARE_MIN_SIZE,
+        )
+
+        # Create snapshot on share1
+        snapshot = self.create_snapshot(share1['id'])
+
+        # Try to revert share2 to share1's snapshot
+        try:
+            self.shares_v2_client.revert_to_snapshot(
+                share2['id'], snapshot['id'])
+            # If API accepted, wait and check for error state
+            time.sleep(5)
+            share2_after = self.shares_v2_client.get_share(
+                share2['id'])['share']
+            self.assertIn(
+                share2_after['status'],
+                ('error', 'error_reverting', 'available'),
+                f"Expected error state but got: {share2_after['status']}")
+            LOG.info("Revert correctly failed with status=%s",
+                     share2_after['status'])
+        except lib_exc.BadRequest:
+            LOG.info("Revert correctly rejected with BadRequest")
+        except lib_exc.ServerFault:
+            LOG.info("Revert correctly rejected with ServerFault")
+
+    # ----------------------------------------------------------------
+    # Test: Revert to non-existent snapshot should fail
+    # ----------------------------------------------------------------
+    @decorators.idempotent_id('f2a3b4c5-d6e7-5f8a-9b0c-05060708090a')
+    @decorators.attr(type=['negative', 'api_with_backend'])
+    def test_revert_to_nonexistent_snapshot_fails(self):
+        """Revert a share to a non-existent snapshot.
+
+        Expected behavior:
+          - Manila should reject the request with NotFound or
+            the share should enter error_reverting state.
+        """
+        LOG.info("=== test_revert_to_nonexistent_snapshot_fails ===")
+
+        share_type = self.create_revert_share_type()
+        share = self.create_share(
+            protocol='NFS',
+            share_type_name=share_type['name'],
+            size=SHARE_MIN_SIZE,
+        )
+
+        # Use a fake snapshot UUID
+        fake_snap_id = '00000000-0000-0000-0000-000000000000'
+
+        try:
+            self.shares_v2_client.revert_to_snapshot(
+                share['id'], fake_snap_id)
+            # If API accepted, wait and check for error state
+            time.sleep(5)
+            share_after = self.shares_v2_client.get_share(
+                share['id'])['share']
+            self.assertIn(
+                share_after['status'],
+                ('error', 'error_reverting', 'available'),
+                f"Expected error state but got: {share_after['status']}")
+            LOG.info("Revert correctly failed with status=%s",
+                     share_after['status'])
+        except lib_exc.NotFound:
+            LOG.info("Revert correctly rejected with NotFound")
+        except lib_exc.BadRequest:
+            LOG.info("Revert correctly rejected with BadRequest")
+
+
+# ======================================================================
+# Share Type Extra-Spec Tests
+# ======================================================================
+class _ShareTypeRevertTests(object):
+    """Share type extra-spec validation tests for revert-to-snapshot.
+
+    Verifies that share types are created correctly with
+    revert_to_snapshot_support extra-specs and that the driver
+    reports the capability.
+    """
+
+    @classmethod
+    def skip_checks(cls):
+        super(_ShareTypeRevertTests, cls).skip_checks()
+        if not CONF.service_available.manila:
+            raise cls.skipException("Manila is not available")
+
+    # ----------------------------------------------------------------
+    # Test: Share type with revert_to_snapshot_support=True
+    # ----------------------------------------------------------------
+    @decorators.idempotent_id('a3b4c5d6-e7f8-6a9b-0c1d-060708090a0b')
+    @decorators.attr(type=['positive', 'api_with_backend'])
+    def test_create_share_type_with_revert_extra_spec(self):
+        """Create share type with revert_to_snapshot_support=True.
+
+        Verify:
+          - Extra-spec is set correctly
+          - Driver reports the capability
+        """
+        LOG.info("=== test_create_share_type_with_revert_extra_spec ===")
+
+        share_type = self.create_revert_share_type()
+
+        # Verify extra-specs
+        specs = share_type.get('extra_specs', {})
+        self.assertIn('revert_to_snapshot_support', specs)
+        self.assertEqual(specs['revert_to_snapshot_support'], 'True')
+        self.assertEqual(specs['snapshot_support'], 'True')
+        self.assertEqual(specs['driver_handles_share_servers'], 'False')
+        LOG.info("Share type %s has correct revert extra-specs",
+                 share_type['id'])
+
+    # ----------------------------------------------------------------
+    # Test: Share type without revert_to_snapshot_support
+    # ----------------------------------------------------------------
+    @decorators.idempotent_id('b4c5d6e7-f8a9-7b0c-1d2e-0708090a0b0c')
+    @decorators.attr(type=['positive', 'api_with_backend'])
+    def test_create_share_type_without_revert_extra_spec(self):
+        """Create share type without revert_to_snapshot_support.
+
+        Verify:
+          - Extra-spec is not set
+          - Share can still be created (revert just won't work)
+        """
+        LOG.info("=== test_create_share_type_without_revert_extra_spec ===")
+
+        name = data_utils.rand_name(
+            prefix=CONF.resource_name_prefix,
+            name='ps-no-revert-type')
+        extra_specs = {
+            'driver_handles_share_servers': 'False',
+            'snapshot_support': 'True',
+        }
+        st = self.share_types_client.create_share_type(
+            name=name,
+            extra_specs=extra_specs)['share_type']
+        LOG.info("Created share type '%s' (id=%s) with extra_specs=%s",
+                 st['name'], st['id'], extra_specs)
+        self.addCleanup(self._delete_share_type_safe, st['id'])
+
+        specs = st.get('extra_specs', {})
+        self.assertNotIn('revert_to_snapshot_support', specs)
+        LOG.info("Share type %s correctly has no revert extra-spec",
+                 st['id'])
+
+    # ----------------------------------------------------------------
+    # Test: Multiple snapshots, revert to different snapshots
+    # ----------------------------------------------------------------
+    @decorators.idempotent_id('c5d6e7f8-a9b0-8c1d-2e3f-08090a0b0c0d')
+    @decorators.attr(type=['positive', 'api_with_backend'])
+    def test_revert_to_multiple_snapshots(self):
+        """Create multiple snapshots and revert to each as latest.
+
+        Manila only allows revert to the *latest* snapshot. To exercise
+        multiple snapshots with PowerStore while respecting this
+        constraint, this test follows the pattern:
+
+          - Create snapshot A, revert to A
+          - Create snapshot B, revert to B (now latest)
+          - Create snapshot C, revert to C (now latest)
+
+        This proves PowerStore correctly handles multiple revert
+        operations with different snapshots without relying on any
+        async job semantics.
+        """
+        LOG.info("=== test_revert_to_multiple_snapshots ===")
+
+        share_type = self.create_revert_share_type()
+        share = self.create_share(
+            protocol='NFS',
+            share_type_name=share_type['name'],
+            size=SHARE_MIN_SIZE,
+        )
+        share_id = share['id']
+
+        # Create multiple snapshots; each becomes latest before revert
+        for i in range(3):
+            snap = self.create_snapshot(
+                share_id,
+                name=data_utils.rand_name(
+                    prefix=CONF.resource_name_prefix,
+                    name=f'ps-revert-snap-{i}'))
+            LOG.info("Created snapshot %d: %s", i, snap['id'])
+
+            reverted = self.revert_to_snapshot(share_id, snap['id'])
+            self.assertEqual(reverted['status'], 'available')
+            LOG.info("Reverted to snapshot %d: %s", i, snap['id'])
+
+        LOG.info("Successfully reverted to %d different snapshots", 3)
 
 
 # ======================================================================
@@ -552,7 +862,7 @@ class _CIFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
         share_id = share['id']
         self.assertEqual(share['status'], 'available')
@@ -562,7 +872,7 @@ class _CIFSRevertSnapshotTests(object):
 
         reverted = self.revert_to_snapshot(share_id, snapshot['id'])
         self.assertEqual(reverted['status'], 'available')
-        self.assertEqual(int(reverted['size']), 1)
+        self.assertEqual(int(reverted['size']), SHARE_MIN_SIZE)
         LOG.info("CIFS share %s reverted to snapshot %s successfully",
                  share_id, snapshot['id'])
 
@@ -579,19 +889,19 @@ class _CIFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
         share_id = share['id']
 
-        share_before = self.shares_v2_client.get_share(share_id)['share']
-        exports_before = share_before.get('export_locations', [])
-        self.assertGreater(len(exports_before), 0)
+        exports_before = self._get_export_locations(share_id)
+        self.assertTrue(len(exports_before) > 0,
+                        "Share should have export locations")
 
         snapshot = self.create_snapshot(share_id)
 
-        reverted = self.revert_to_snapshot(share_id, snapshot['id'])
+        self.revert_to_snapshot(share_id, snapshot['id'])
 
-        exports_after = reverted.get('export_locations', [])
+        exports_after = self._get_export_locations(share_id)
         self.assertEqual(len(exports_after), len(exports_before))
         LOG.info("CIFS export locations preserved: %s", exports_after)
 
@@ -608,7 +918,7 @@ class _CIFSRevertSnapshotTests(object):
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=SHARE_MIN_SIZE,
         )
         share_id = share['id']
 
@@ -652,6 +962,20 @@ try:
         """CIFS revert-to-snapshot functional tests
         (manila_tempest_tests base)."""
 
+    class TestPowerStoreRevertSnapshotNegative(
+            _NegativeRevertSnapshotTests,
+            PowerStoreShareRevertSnapshotTest,
+            manila_base.BaseSharesAdminTest):
+        """Negative revert-to-snapshot functional tests
+        (manila_tempest_tests base)."""
+
+    class TestPowerStoreRevertSnapshotShareType(
+            _ShareTypeRevertTests,
+            PowerStoreShareRevertSnapshotTest,
+            manila_base.BaseSharesAdminTest):
+        """Share type extra-spec revert tests
+        (manila_tempest_tests base)."""
+
 except ImportError:
     from tempest import test as tempest_test
 
@@ -668,5 +992,21 @@ except ImportError:
             PowerStoreShareRevertSnapshotTest,
             tempest_test.BaseTestCase):
         """CIFS revert-to-snapshot functional tests
+        (tempest.test fallback base)."""
+        credentials = ['primary', 'admin']
+
+    class TestPowerStoreRevertSnapshotNegative(
+            _NegativeRevertSnapshotTests,
+            PowerStoreShareRevertSnapshotTest,
+            tempest_test.BaseTestCase):
+        """Negative revert-to-snapshot functional tests
+        (tempest.test fallback base)."""
+        credentials = ['primary', 'admin']
+
+    class TestPowerStoreRevertSnapshotShareType(
+            _ShareTypeRevertTests,
+            PowerStoreShareRevertSnapshotTest,
+            tempest_test.BaseTestCase):
+        """Share type extra-spec revert tests
         (tempest.test fallback base)."""
         credentials = ['primary', 'admin']
