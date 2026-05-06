@@ -53,21 +53,44 @@ class DellTempestPlugin(plugins.TempestPlugin):
         return ['dell_tempest_plugin/tests']
     
     
+    def _get_driver(self):
+        """Safely read dell_driver.driver from config, default to 'all'."""
+        try:
+            CONF = cfg.CONF
+            driver = CONF.dell_driver.driver
+        except (cfg.NoSuchGroupError, cfg.NoSuchOptError):
+            driver = 'all'
+        return driver if driver else 'all'
+
+    def _get_all_test_dirs(self, base_path):
+        """Return all backend test subdirectories that contain test files."""
+        tests_root = os.path.join(base_path, 'tests')
+        dirs = []
+        if not os.path.isdir(tests_root):
+            return [tests_root]
+        for entry in sorted(os.listdir(tests_root)):
+            sub = os.path.join(tests_root, entry)
+            if os.path.isdir(sub) and not entry.startswith(('__', '.', 'base')):
+                dirs.append(sub)
+        return dirs if dirs else [tests_root]
+
     def get_test_paths(self):
-        CONF = cfg.CONF
-        driver = CONF.dell_driver.driver
+        driver = self._get_driver()
         LOG.info(f"DELL_DRIVER in plugin: {driver}")
 
         base_path = os.path.dirname(os.path.abspath(__file__))
 
-        if driver == 'powerstore':
-            return [os.path.join(base_path, 'tests', 'powerstore')]
-        elif driver == 'powerflex':
-            return [os.path.join(base_path, 'tests', 'powerflex')]
-        elif driver == 'powerscale':
-            return [os.path.join(base_path, 'tests', 'powerscale')]
-        else:
-            return [os.path.join(base_path, 'tests')]
+        if driver == 'all':
+            return self._get_all_test_dirs(base_path)
+
+        # Dynamic: use the driver name as the test subdirectory
+        driver_test_dir = os.path.join(base_path, 'tests', driver)
+        if os.path.isdir(driver_test_dir):
+            return [driver_test_dir]
+
+        LOG.warning(f"No test directory found for driver '{driver}', "
+                    f"falling back to all test directories")
+        return self._get_all_test_dirs(base_path)
 
     def get_tempest_plugins(self):
         return []
@@ -76,28 +99,25 @@ class DellTempestPlugin(plugins.TempestPlugin):
     def load_tests(self):
         base_path = os.path.split(os.path.dirname(os.path.abspath(__file__)))[0]
         test_dir = "dell_tempest_plugin"
-        
-        CONF = cfg.CONF
-        driver = CONF.dell_driver.driver
-        LOG.info(f"DELL_DRIVER in plugin: {driver}")
 
+        driver = self._get_driver()
+        LOG.info(f"DELL_DRIVER in load_tests: {driver}")
 
-        if driver == 'powerstore':
-            full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerstore')
-        elif driver == 'powerflex':
-            full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerflex')
-        elif driver == 'powerscale':
-            full_test_dir = os.path.join(base_path, test_dir, 'tests', 'powerscale')
-        else:
-            full_test_dir = os.path.join(base_path, test_dir, 'tests')
+        if driver != 'all':
+            candidate = os.path.join(base_path, test_dir, 'tests', driver)
+            if os.path.isdir(candidate):
+                return candidate, base_path
+            LOG.warning(f"No test directory for driver '{driver}', "
+                        f"falling back to base tests directory")
 
+        full_test_dir = os.path.join(base_path, test_dir, 'tests')
         return full_test_dir, base_path
 
 
     def get_metadata(self):
         return {
-            'display_name': 'Dell PowerStore Tempest Plugin',
-            'description': 'Tempest tests for Dell EMC PowerStore Cinder driver',
+            'display_name': 'Dell Tempest Plugin',
+            'description': 'Tempest tests for Dell EMC storage drivers (PowerStore, PowerFlex, PowerScale, PowerMax, Unity)',
             'maintainer': 'Dell EMC OpenStack Team',
         }
 
