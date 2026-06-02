@@ -52,7 +52,15 @@ Driver methods tested:
 """
 
 import json
+import os
 import time
+
+# Ensure TEMPEST_CONFIG_DIR is set so tempest can find tempest.conf
+# when running with plain pytest outside of the tempest test runner.
+if 'TEMPEST_CONFIG_DIR' not in os.environ:
+    _candidate = os.path.join(os.getcwd(), 'tempest', 'etc')
+    if os.path.isfile(os.path.join(_candidate, 'tempest.conf')):
+        os.environ['TEMPEST_CONFIG_DIR'] = _candidate
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -78,6 +86,8 @@ except cfg.DuplicateOptError:
 
 SHARE_BUILD_TIMEOUT = 600
 SHARE_BUILD_INTERVAL = 5
+# Shorter timeout for negative tests
+NEGATIVE_TEST_TIMEOUT = 60
 
 # Minimum Manila API microversion that supports QoS types
 QOS_TYPE_MIN_API_VERSION = '2.94'
@@ -240,19 +250,22 @@ class PowerStoreQoSShareTest(object):
     # Share type helpers
     # ------------------------------------------------------------------
     def create_qos_share_type(self, qos_type_name, name=None,
-                              extra_specs=None):
+                              extra_specs=None, backend_name=None):
         """Create a share type with default_qos_type pointing to a QoS type.
 
         :param qos_type_name: Name of the QoS type to link.
         :param name: Optional share type name.
         :param extra_specs: Additional extra-specs dict to merge.
+        :param backend_name: Optional backend name for share_backend_name extra_spec.
         :returns: Created share type dict.
         """
         name = name or data_utils.rand_name('ps-manila-qos-share-type')
         specs = {
-            'driver_handles_share_servers': 'False',
+            'driver_handles_share_servers': str(CONF.share.multitenancy_enabled),
             'default_qos_type': qos_type_name,
         }
+        if backend_name:
+            specs['share_backend_name'] = backend_name
         if extra_specs:
             specs.update(extra_specs)
 
@@ -266,10 +279,18 @@ class PowerStoreQoSShareTest(object):
         self.addCleanup(self._delete_share_type_safe, st['id'])
         return st
 
-    def create_plain_share_type(self, name=None, extra_specs=None):
-        """Create a share type WITHOUT default_qos_type."""
+    def create_plain_share_type(self, name=None, extra_specs=None, backend_name=None):
+        """Create a share type WITHOUT default_qos_type.
+
+        :param name: Optional share type name.
+        :param extra_specs: Additional extra-specs dict to merge.
+        :param backend_name: Optional backend name for share_backend_name extra_spec.
+        :returns: Created share type dict.
+        """
         name = name or data_utils.rand_name('ps-manila-no-qos-type')
-        specs = {'driver_handles_share_servers': 'False'}
+        specs = {'driver_handles_share_servers': str(CONF.share.multitenancy_enabled)}
+        if backend_name:
+            specs['share_backend_name'] = backend_name
         if extra_specs:
             specs.update(extra_specs)
 
@@ -297,15 +318,17 @@ class PowerStoreQoSShareTest(object):
     # ------------------------------------------------------------------
     # Share helpers
     # ------------------------------------------------------------------
-    def create_share(self, protocol, share_type_name, size=1, name=None):
+    def create_share(self, protocol, share_type_name, size=None, name=None):
         """Create a Manila share and wait until it becomes available.
 
         :param protocol: 'NFS' or 'CIFS'
         :param share_type_name: Name of the share type to use.
-        :param size: Share size in GB.
+        :param size: Share size in GB. If None, uses CONF.share.share_size.
         :param name: Optional share name.
         :returns: Created share dict.
         """
+        if size is None:
+            size = getattr(CONF.share, 'share_size', 3)
         name = name or data_utils.rand_name(
             f'ps-manila-qos-{protocol.lower()}')
         share = self.shares_v2_client.create_share(
@@ -323,8 +346,25 @@ class PowerStoreQoSShareTest(object):
             'share', self.shares_v2_client.get_share(sh['id']))
 
     def _delete_share_safe(self, share_id):
-        """Delete a share and wait for it to be removed."""
+        """Delete a share and wait for it to be removed.
+
+        If the share is already in error_deleting state, skip the wait
+        since it may never complete due to driver issues.
+        """
         try:
+            # Check current status before attempting deletion
+            try:
+                result = self.shares_v2_client.get_share(share_id)
+                sh = result.get('share', result)
+                status = sh.get('status', '').lower()
+                if status == 'error_deleting':
+                    LOG.warning("Share %s is already in error_deleting state, "
+                                "skipping deletion attempt", share_id)
+                    return
+            except lib_exc.NotFound:
+                LOG.debug("Share %s already gone", share_id)
+                return
+
             self.shares_v2_client.delete_share(share_id)
             LOG.info("Requested deletion of share %s", share_id)
         except lib_exc.NotFound:
@@ -359,11 +399,17 @@ class PowerStoreQoSShareTest(object):
     def _wait_for_share_deletion(self, share_id,
                                  timeout=SHARE_BUILD_TIMEOUT,
                                  interval=SHARE_BUILD_INTERVAL):
-        """Poll until share is gone (NotFound)."""
+        """Poll until share is gone (NotFound) or reaches a terminal error."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                self.shares_v2_client.get_share(share_id)
+                result = self.shares_v2_client.get_share(share_id)
+                sh = result.get('share', result)
+                status = sh.get('status', '').lower()
+                if status == 'error_deleting':
+                    LOG.warning("Share %s is stuck in error_deleting state",
+                                share_id)
+                    return
             except lib_exc.NotFound:
                 LOG.info("Share %s deletion confirmed", share_id)
                 return
@@ -480,6 +526,13 @@ class PowerStoreQoSShareTest(object):
             return locations
         return []
 
+    def _get_backend_name(self):
+        """Get the backend name from config."""
+        backend_names = getattr(CONF.share, 'backend_names', [])
+        if backend_names:
+            return backend_names[0]
+        return None
+
 
 # ======================================================================
 # NFS QoS Tests
@@ -515,15 +568,16 @@ class _NFSQoSTests(object):
 
         qos_type = self.create_qos_type(specs={'max_bw': '100'})
 
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
         self.assertIn('default_qos_type',
                       share_type.get('extra_specs', {}))
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
 
         self.assertEqual(share['status'], 'available',
@@ -549,14 +603,14 @@ class _NFSQoSTests(object):
         """
         LOG.info("=== test_create_nfs_share_without_qos ===")
 
-        share_type = self.create_plain_share_type()
+        backend_name = self._get_backend_name()
+        share_type = self.create_plain_share_type(backend_name=backend_name)
         self.assertNotIn('default_qos_type',
                          share_type.get('extra_specs', {}))
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
 
         self.assertEqual(share['status'], 'available')
@@ -579,12 +633,13 @@ class _NFSQoSTests(object):
         LOG.info("=== test_delete_nfs_share_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '500'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
         share_id = share['id']
         self.assertEqual(share['status'], 'available')
@@ -619,13 +674,14 @@ class _NFSQoSTests(object):
         LOG.info("=== test_nfs_qos_lifecycle ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '1000'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
         self.assertEqual(share['status'], 'available')
         share_id = share['id']
@@ -661,13 +717,14 @@ class _NFSQoSTests(object):
         qos_type = self.create_qos_type(specs={
             'max_bw': str(QOS_MAX_BW_MIN),
         })
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
 
         self.assertEqual(share['status'], 'available')
@@ -689,13 +746,14 @@ class _NFSQoSTests(object):
         qos_type = self.create_qos_type(specs={
             'max_bw': str(QOS_MAX_BW_MAX),
         })
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
 
         self.assertEqual(share['status'], 'available')
@@ -716,15 +774,16 @@ class _NFSQoSTests(object):
         LOG.info("=== test_multiple_nfs_shares_same_qos_type ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '200'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         shares = []
         for i in range(2):
             share = self.create_share(
                 protocol='NFS',
                 share_type_name=share_type['name'],
-                size=1,
                 name=data_utils.rand_name(f'ps-manila-qos-multi-{i}'),
             )
             self.assertEqual(share['status'], 'available')
@@ -764,25 +823,27 @@ class _NFSQoSTests(object):
         LOG.info("=== test_extend_nfs_share_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '300'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=3,
         )
         share_id = share['id']
         self.assertEqual(share['status'], 'available')
 
-        # Extend from 1 GB to 2 GB
-        self.extend_share(share_id, 2)
+        # Extend from 3 GB to 4 GB
+        self.extend_share(share_id, 4)
 
         updated = self.shares_v2_client.get_share(share_id)
         sh = updated.get('share', updated)
         self.assertEqual(sh['status'], 'available')
-        self.assertEqual(sh['size'], 2)
-        LOG.info("NFS share %s extended to 2 GB with QoS preserved",
+        self.assertEqual(sh['size'], 4)
+        LOG.info("NFS share %s extended to 4 GB with QoS preserved",
                  share_id)
 
     # ----------------------------------------------------------------
@@ -799,25 +860,27 @@ class _NFSQoSTests(object):
         LOG.info("=== test_shrink_nfs_share_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '400'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=2,
+            size=4,
         )
         share_id = share['id']
         self.assertEqual(share['status'], 'available')
 
-        # Shrink from 2 GB to 1 GB
-        self.shrink_share(share_id, 1)
+        # Shrink from 4 GB to 3 GB (minimum size is 3 GB per filter_function)
+        self.shrink_share(share_id, 3)
 
         updated = self.shares_v2_client.get_share(share_id)
         sh = updated.get('share', updated)
         self.assertEqual(sh['status'], 'available')
-        self.assertEqual(sh['size'], 1)
-        LOG.info("NFS share %s shrunk to 1 GB with QoS preserved",
+        self.assertEqual(sh['size'], 3)
+        LOG.info("NFS share %s shrunk to 3 GB with QoS preserved",
                  share_id)
 
     # ----------------------------------------------------------------
@@ -836,14 +899,19 @@ class _NFSQoSTests(object):
         LOG.info("=== test_create_nfs_share_from_snapshot_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '600'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name,
+            extra_specs={
+                'snapshot_support': 'True',
+                'create_share_from_snapshot_support': 'True'
+            })
 
         # Create original share
         original = self.create_share(
             protocol='NFS',
             share_type_name=share_type['name'],
-            size=1,
         )
         self.assertEqual(original['status'], 'available')
 
@@ -852,9 +920,10 @@ class _NFSQoSTests(object):
 
         # Create share from snapshot
         clone_name = data_utils.rand_name('ps-manila-qos-clone')
+        share_size = getattr(CONF.share, 'share_size', 3)
         clone = self.shares_v2_client.create_share(
             share_protocol='NFS',
-            size=1,
+            size=share_size,
             name=clone_name,
             share_type_id=share_type['name'],
             snapshot_id=snapshot['id'],
@@ -883,28 +952,45 @@ class _NFSQoSTests(object):
         LOG.info("=== test_create_nfs_share_with_invalid_qos_zero_bw ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '0'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         name = data_utils.rand_name('ps-manila-qos-invalid-bw')
         try:
             share = self.shares_v2_client.create_share(
                 share_protocol='NFS',
-                size=1,
                 name=name,
                 share_type_id=share_type['name'],
             )
             sh = share.get('share', share)
+            share_id = sh['id']
+
+            # Register cleanup for the share - this will run even if manual deletion fails
             self.addCleanup(self._delete_share_safe, sh['id'])
-            # Wait a bit for the share to fail
-            time.sleep(15)
-            result = self.shares_v2_client.get_share(sh['id'])
-            result_sh = result.get('share', result)
-            self.assertIn(result_sh['status'], ('error',),
-                          f"Expected error status but got: "
-                          f"{result_sh['status']}")
+
+            # Wait for share to reach error or available status
+            status = None
+            deadline = time.time() + NEGATIVE_TEST_TIMEOUT
+            while time.time() < deadline:
+                result = self.shares_v2_client.get_share(share_id)
+                result_sh = result.get('share', result)
+                status = result_sh.get('status', '').lower()
+                if status in ('error', 'available'):
+                    break
+                time.sleep(SHARE_BUILD_INTERVAL)
+
+            if status != 'error':
+                self.fail(
+                    f"Expected error status but got: {status}. "
+                    f"If share became 'available', the backend may not be "
+                    f"properly validating max_bw >= 1 constraint.")
             LOG.info("Share correctly failed with status=%s "
-                     "(invalid max_bw=0)", result_sh['status'])
+                     "(invalid max_bw=0)", status)
+            # Try to delete the failed share so share type and QoS type can be cleaned up
+            # This may fail if the driver has issues deleting shares in error state
+            self._delete_share_safe(sh['id'])
         except (lib_exc.BadRequest, lib_exc.ServerFault):
             LOG.info("Share creation correctly rejected (invalid max_bw=0)")
 
@@ -920,28 +1006,70 @@ class _NFSQoSTests(object):
         """
         LOG.info("=== test_create_nfs_share_with_invalid_qos_non_numeric ===")
 
-        qos_type = self.create_qos_type(specs={'max_bw': 'abc'})
-        share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+        # Create QoS type without cleanup registration
+        qos_type_name = data_utils.rand_name('ps-manila-qos-type-invalid')
+        body = {
+            'qos_type': {
+                'name': qos_type_name,
+                'specs': {'max_bw': 'abc'},
+            }
+        }
+        resp, resp_body = self._qos_type_request('POST', body=body)
+        qos_type = resp_body.get('qos_type', resp_body)
+        
+        backend_name = self._get_backend_name()
+        # Create share type without cleanup registration
+        share_type_name = data_utils.rand_name('ps-manila-qos-share-type-invalid')
+        specs = {
+            'driver_handles_share_servers': str(CONF.share.multitenancy_enabled),
+            'default_qos_type': qos_type_name,
+        }
+        if backend_name:
+            specs['share_backend_name'] = backend_name
+        share_type = self.share_types_client.create_share_type(
+            name=share_type_name,
+            extra_specs=specs,
+        )
+        st = share_type.get('share_type', share_type)
+
+        # Register cleanup for share type and QoS type
+        self.addCleanup(self._delete_share_type_safe, st['id'])
+        self.addCleanup(self._delete_qos_type_safe, qos_type['id'])
 
         name = data_utils.rand_name('ps-manila-qos-invalid-str')
+        share_id = None
         try:
             share = self.shares_v2_client.create_share(
                 share_protocol='NFS',
-                size=1,
                 name=name,
-                share_type_id=share_type['name'],
+                share_type_id=share_type_name,
             )
             sh = share.get('share', share)
+            share_id = sh['id']
+
+            # Register cleanup for the share - this will run even if manual deletion fails
             self.addCleanup(self._delete_share_safe, sh['id'])
-            time.sleep(15)
-            result = self.shares_v2_client.get_share(sh['id'])
-            result_sh = result.get('share', result)
-            self.assertIn(result_sh['status'], ('error',),
-                          f"Expected error status but got: "
-                          f"{result_sh['status']}")
+
+            status = None
+            deadline = time.time() + NEGATIVE_TEST_TIMEOUT
+            while time.time() < deadline:
+                result = self.shares_v2_client.get_share(share_id)
+                result_sh = result.get('share', result)
+                status = result_sh.get('status', '').lower()
+                if status in ('error', 'available'):
+                    break
+                time.sleep(SHARE_BUILD_INTERVAL)
+
+            if status != 'error':
+                self.fail(
+                    f"Expected error status but got: {status}. "
+                    f"If share became 'available', the backend may not be "
+                    f"properly validating the QoS spec.")
             LOG.info("Share correctly failed with status=%s "
-                     "(non-numeric max_bw)", result_sh['status'])
+                     "(non-numeric max_bw)", status)
+            # Try to delete the failed share so share type and QoS type can be cleaned up
+            # This may fail if the driver has issues deleting shares in error state
+            self._delete_share_safe(sh['id'])
         except (lib_exc.BadRequest, lib_exc.ServerFault):
             LOG.info("Share creation correctly rejected "
                      "(non-numeric max_bw)")
@@ -963,27 +1091,45 @@ class _NFSQoSTests(object):
             'max_bw': '100',
             'max_iops': '1000',
         })
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         name = data_utils.rand_name('ps-manila-qos-unsupported')
         try:
             share = self.shares_v2_client.create_share(
                 share_protocol='NFS',
-                size=1,
                 name=name,
                 share_type_id=share_type['name'],
             )
             sh = share.get('share', share)
+            share_id = sh['id']
+
+            # Register cleanup for the share - this will run even if manual deletion fails
             self.addCleanup(self._delete_share_safe, sh['id'])
-            time.sleep(15)
-            result = self.shares_v2_client.get_share(sh['id'])
-            result_sh = result.get('share', result)
-            self.assertIn(result_sh['status'], ('error',),
-                          f"Expected error status but got: "
-                          f"{result_sh['status']}")
+
+            # Wait for share to reach error or available status
+            status = None
+            deadline = time.time() + NEGATIVE_TEST_TIMEOUT
+            while time.time() < deadline:
+                result = self.shares_v2_client.get_share(share_id)
+                result_sh = result.get('share', result)
+                status = result_sh.get('status', '').lower()
+                if status in ('error', 'available'):
+                    break
+                time.sleep(SHARE_BUILD_INTERVAL)
+
+            if status != 'error':
+                self.fail(
+                    f"Expected error status but got: {status}. "
+                    f"If share became 'available', the backend may not be "
+                    f"properly validating unsupported QoS keys.")
             LOG.info("Share correctly failed with status=%s "
-                     "(unsupported QoS key)", result_sh['status'])
+                     "(unsupported QoS key)", status)
+            # Try to delete the failed share so share type and QoS type can be cleaned up
+            # This may fail if the driver has issues deleting shares in error state
+            self._delete_share_safe(sh['id'])
         except (lib_exc.BadRequest, lib_exc.ServerFault):
             LOG.info("Share creation correctly rejected "
                      "(unsupported QoS key)")
@@ -1022,13 +1168,14 @@ class _CIFSQoSTests(object):
         LOG.info("=== test_create_cifs_share_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '100'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
         )
 
         self.assertEqual(share['status'], 'available')
@@ -1047,11 +1194,11 @@ class _CIFSQoSTests(object):
         """Create a CIFS share without QoS type."""
         LOG.info("=== test_create_cifs_share_without_qos ===")
 
-        share_type = self.create_plain_share_type()
+        backend_name = self._get_backend_name()
+        share_type = self.create_plain_share_type(backend_name=backend_name)
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
         )
 
         self.assertEqual(share['status'], 'available')
@@ -1068,12 +1215,13 @@ class _CIFSQoSTests(object):
         LOG.info("=== test_delete_cifs_share_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '500'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
         )
         share_id = share['id']
 
@@ -1098,13 +1246,14 @@ class _CIFSQoSTests(object):
         LOG.info("=== test_cifs_qos_lifecycle ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '2000'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
         )
         self.assertEqual(share['status'], 'available')
 
@@ -1129,24 +1278,26 @@ class _CIFSQoSTests(object):
         LOG.info("=== test_extend_cifs_share_with_qos ===")
 
         qos_type = self.create_qos_type(specs={'max_bw': '300'})
+        backend_name = self._get_backend_name()
         share_type = self.create_qos_share_type(
-            qos_type_name=qos_type['name'])
+            qos_type_name=qos_type['name'],
+            backend_name=backend_name)
 
         share = self.create_share(
             protocol='CIFS',
             share_type_name=share_type['name'],
-            size=1,
+            size=3,
         )
         share_id = share['id']
         self.assertEqual(share['status'], 'available')
 
-        self.extend_share(share_id, 2)
+        self.extend_share(share_id, 4)
 
         updated = self.shares_v2_client.get_share(share_id)
         sh = updated.get('share', updated)
         self.assertEqual(sh['status'], 'available')
-        self.assertEqual(sh['size'], 2)
-        LOG.info("CIFS share %s extended to 2 GB with QoS preserved",
+        self.assertEqual(sh['size'], 4)
+        LOG.info("CIFS share %s extended from 3 GB to 4 GB with QoS preserved",
                  share_id)
 
 
@@ -1280,18 +1431,19 @@ class _QoSShareTypeTests(object):
         self.assertEqual(specs2.get('max_bw'), '200')
 
         # Create shares with each QoS type
-        st1 = self.create_qos_share_type(qos_type_name=qt1['name'])
-        st2 = self.create_qos_share_type(qos_type_name=qt2['name'])
+        backend_name = self._get_backend_name()
+        st1 = self.create_qos_share_type(qos_type_name=qt1['name'],
+                                          backend_name=backend_name)
+        st2 = self.create_qos_share_type(qos_type_name=qt2['name'],
+                                          backend_name=backend_name)
 
         share1 = self.create_share(
             protocol='NFS',
             share_type_name=st1['name'],
-            size=1,
         )
         share2 = self.create_share(
             protocol='NFS',
             share_type_name=st2['name'],
-            size=1,
         )
 
         self.assertEqual(share1['status'], 'available')
