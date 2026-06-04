@@ -924,12 +924,75 @@ class _SnapshotManageUnmanageTests(object):
         LOG.info("Re-managed snapshot %s after unmanage — no data loss",
                  remanaged['id'])
 
+    # ----------------------------------------------------------------
+    # 8. Manila-native snapshot lifecycle (create → unmanage → re-manage)
+    # ----------------------------------------------------------------
+    @decorators.idempotent_id('ff08a1b2-0008-8888-9999-a1b2c3d4e5f6')
+    @decorators.attr(type=['positive', 'api_with_backend'])
+    def test_manila_snapshot_lifecycle(self):
+        """Create snapshot via Manila, unmanage, re-manage using provider_location.
+
+        This validates the critical fix: create_snapshot() must return
+        provider_location so that the unmanage → re-manage lifecycle works.
+        Before the fix, provider_location was None and re-manage would fail
+        because the new DB entry gets a different snapshot['name'].
+        """
+        LOG.info("=== test_manila_snapshot_lifecycle [%s] ===", self.protocol)
+
+        share_type = self.create_manage_share_type()
+        share = self.create_manila_share(
+            self.protocol, share_type_id=share_type['id'])
+
+        # Create snapshot via Manila (not directly on backend)
+        snap_name = data_utils.rand_name('ps-lifecycle-snap')
+        snapshot = self.shares_v2_client.create_snapshot(
+            share_id=share['id'], name=snap_name)
+        snap = snapshot.get('snapshot', snapshot)
+        self.addCleanup(self._delete_snapshot_safe, snap['id'])
+        self._wait_for_snapshot_status(snap['id'], 'available')
+
+        # CRITICAL: Verify provider_location is set after create_snapshot
+        snap_detail = self.shares_v2_client.get_snapshot(snap['id'])
+        snap_detail = snap_detail.get('snapshot', snap_detail)
+        provider_loc = snap_detail.get('provider_location')
+        self.assertIsNotNone(
+            provider_loc,
+            "provider_location must be set after create_snapshot")
+        self.assertTrue(
+            len(provider_loc) > 0,
+            "provider_location must not be empty")
+        LOG.info("provider_location correctly set: %s", provider_loc)
+
+        # Unmanage the snapshot
+        self.shares_v2_client.unmanage_snapshot(snap['id'])
+        self._wait_for_snapshot_deletion(snap['id'])
+
+        # Verify backend snapshot still exists
+        backend_fs = self._ps_get_filesystem_by_name(provider_loc)
+        self.assertIsNotNone(backend_fs,
+                             "Backend snapshot deleted on unmanage!")
+
+        # Re-manage using the saved provider_location
+        remanaged = self.manage_snapshot(
+            share_id=share['id'],
+            provider_location=provider_loc,
+        )
+        self._wait_for_snapshot_status(remanaged['id'], 'available')
+
+        remanaged_detail = self.shares_v2_client.get_snapshot(remanaged['id'])
+        remanaged_detail = remanaged_detail.get('snapshot', remanaged_detail)
+        self.assertEqual('available', remanaged_detail['status'])
+        self.assertEqual(share['id'], remanaged_detail['share_id'])
+        self.assertEqual(PS_MIN_SIZE, remanaged_detail['size'])
+        LOG.info("Manila-native snapshot lifecycle complete: "
+                 "create → unmanage → re-manage succeeded")
+
     # ================================================================
     # EDGE CASE TESTS — SIZE HANDLING
     # ================================================================
 
     # ----------------------------------------------------------------
-    # 8. Size override — backend size takes precedence
+    # 9. Size override — backend size takes precedence
     # ----------------------------------------------------------------
     @decorators.idempotent_id('bb08c9d0-0008-8888-9999-e1f2a3b4c5d6')
     @decorators.attr(type=['positive', 'api_with_backend'])
@@ -961,7 +1024,7 @@ class _SnapshotManageUnmanageTests(object):
         LOG.info("Backend size correctly overrode user-provided size")
 
     # ----------------------------------------------------------------
-    # 9. No size provided — backend size used
+    # 10. No size provided — backend size used
     # ----------------------------------------------------------------
     @decorators.idempotent_id('cc09d0e1-0009-9999-aaaa-f2a3b4c5d6e7')
     @decorators.attr(type=['positive', 'api_with_backend'])
@@ -990,7 +1053,7 @@ class _SnapshotManageUnmanageTests(object):
     # ================================================================
 
     # ----------------------------------------------------------------
-    # 10. Invalid provider_location — nonexistent snapshot
+    # 11. Invalid provider_location — nonexistent snapshot
     # ----------------------------------------------------------------
     @decorators.idempotent_id('dd10e1f2-0010-aaaa-bbbb-a3b4c5d6e7f8')
     @decorators.attr(type=['negative', 'api_with_backend'])
@@ -1015,7 +1078,7 @@ class _SnapshotManageUnmanageTests(object):
         LOG.info("Correctly failed managing nonexistent snapshot")
 
     # ----------------------------------------------------------------
-    # 11. Not a snapshot — regular filesystem with no parent_id
+    # 12. Not a snapshot — regular filesystem with no parent_id
     # ----------------------------------------------------------------
     @decorators.idempotent_id('ee11f2a3-0011-bbbb-cccc-b4c5d6e7f8a9')
     @decorators.attr(type=['negative', 'api_with_backend'])
@@ -1043,7 +1106,7 @@ class _SnapshotManageUnmanageTests(object):
         LOG.info("Correctly failed managing non-snapshot filesystem")
 
     # ----------------------------------------------------------------
-    # 12. Parent mismatch — snapshot belongs to different share
+    # 13. Parent mismatch — snapshot belongs to different share
     # ----------------------------------------------------------------
     @decorators.idempotent_id('ff12a3b4-0012-cccc-dddd-c5d6e7f8a9b0')
     @decorators.attr(type=['negative', 'api_with_backend'])
@@ -1080,7 +1143,7 @@ class _SnapshotManageUnmanageTests(object):
         LOG.info("Correctly failed: snapshot parent mismatch")
 
     # ----------------------------------------------------------------
-    # 13. Manage already managed snapshot (duplicate/conflict)
+    # 14. Manage already managed snapshot (duplicate/conflict)
     # ----------------------------------------------------------------
     @decorators.idempotent_id('aa13b4c5-0013-dddd-eeee-d6e7f8a9b0c1')
     @decorators.attr(type=['negative', 'api_with_backend'])
@@ -1112,7 +1175,7 @@ class _SnapshotManageUnmanageTests(object):
             LOG.info("Second manage correctly rejected by API")
 
     # ----------------------------------------------------------------
-    # 14. Invalid size format in driver_options
+    # 15. Invalid size format in driver_options
     # ----------------------------------------------------------------
     @decorators.idempotent_id('bb14c5d6-0014-eeee-ffff-e7f8a9b0c1d2')
     @decorators.attr(type=['positive', 'api_with_backend'])
