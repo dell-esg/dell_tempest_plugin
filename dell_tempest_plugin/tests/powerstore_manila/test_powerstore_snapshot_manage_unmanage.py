@@ -1220,12 +1220,20 @@ try:
         """NFS snapshot manage/unmanage functional tests."""
         protocol = 'NFS'
 
+        @classmethod
+        def tearDownClass(cls):
+            super(TestPowerStoreSnapshotManageNFS, cls).tearDownClass()
+
     class TestPowerStoreSnapshotManageCIFS(
             _SnapshotManageUnmanageTests,
             PowerStoreSnapshotManageUnmanageBase,
             manila_base.BaseSharesAdminTest):
         """CIFS snapshot manage/unmanage functional tests."""
         protocol = 'CIFS'
+
+        @classmethod
+        def tearDownClass(cls):
+            super(TestPowerStoreSnapshotManageCIFS, cls).tearDownClass()
 
 except ImportError:
     from tempest import test as tempest_test
