@@ -26,7 +26,10 @@ Tested operations
 * Verify metro replication session is created on PowerStore
 * Delete a metro volume (end_metro + delete)
 * Extend a metro volume (requires paused session -- negative test)
-* Clone a metro volume (not supported -- negative)
+* Clone a metro volume (positive, supported on 4.4+)
+* Create a volume from snapshot of a metro volume (positive)
+* Create a volume from snapshot larger than the source
+  (clone -> extend -> configure metro, supported on 4.4+)
 * Create a snapshot of a metro volume
 * Delete a snapshot of a metro volume
 * Revert to snapshot of metro volume (requires paused -- negative)
@@ -241,7 +244,7 @@ class PowerStoreMetroVolumeBase(object):
         """
         resp = self._ps_get("/volume", params={
             "name": "eq.%s" % name,
-            "select": "id,name,metro_replication_session_id,"
+            "select": "id,name,size,metro_replication_session_id,"
                       "protection_data,type",
         })
         if resp.status_code == 200 and resp.json():
@@ -307,6 +310,33 @@ class PowerStoreMetroVolumeBase(object):
             session = self._ps_get_replication_session(session_id)
             if session:
                 return session_id
+        return None
+
+    def _wait_for_metro_session_ready(self, volume_name,
+                                      timeout=120, interval=5):
+        """Wait until the PowerStore metro session is in a stable state.
+
+        end_metro on a session that is still 'Initializing' can be very
+        slow and time out.  We wait for 'OK' or 'Synchronized' before
+        deleting to keep cleanup fast and reliable.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            session_id = self._ps_volume_has_metro_session(volume_name)
+            if session_id:
+                session = self._ps_get_replication_session(session_id)
+                if session:
+                    state = session.get('state')
+                    if state in ('OK', 'Synchronized'):
+                        LOG.info("PowerStore metro session '%s' for '%s' "
+                                 "is stable (state=%s)",
+                                 session_id, volume_name, state)
+                        return session_id
+                    LOG.info("Waiting for metro session '%s' on '%s': "
+                             "state=%s", session_id, volume_name, state)
+            time.sleep(interval)
+        LOG.warning("Timeout waiting for metro session on '%s' to be "
+                    "OK/Synchronized", volume_name)
         return None
 
     # ------------------------------------------------------------------
@@ -914,3 +944,107 @@ class PowerStoreMetroVolumeTest(PowerStoreMetroVolumeBase,
             current_connectivity, valid_options,
             "Host connectivity '%s' should be one of %s"
             % (current_connectivity, valid_options))
+
+    # ==================================================================
+    # Test: clone a metro volume (positive)
+    # ==================================================================
+    @decorators.idempotent_id('a4b5c6d7-1234-5678-abcd-000000000001')
+    def test_clone_metro_volume(self):
+        """Clone a metro volume and verify the clone is also metro."""
+
+        LOG.info("=== test_clone_metro_volume ===")
+        vt = self._create_metro_volume_type()
+        source_vol = self._create_volume(vt['name'], size=1)
+        source_backend_name = "volume-%s" % source_vol['id']
+        self._wait_for_metro_session_ready(source_backend_name)
+
+        cloned = self.vols.create_volume(
+            name=data_utils.rand_name(
+                prefix=CONF.resource_name_prefix,
+                name='ps-metro-clone'),
+            size=1,
+            volume_type=vt['name'],
+            source_volid=source_vol['id'],
+        )['volume']
+        self.addCleanup(self._delete_volume_safe, cloned['id'])
+        cloned_info = self._wait_for_volume_status(
+            cloned['id'], 'available', timeout=180)
+
+        self.assertEqual(
+            'enabled', cloned_info.get('replication_status'),
+            "Cloned metro volume should have replication_status='enabled', "
+            "got '%s'" % cloned_info.get('replication_status'))
+
+        clone_backend_name = "volume-%s" % cloned['id']
+        clone_session = self._wait_for_metro_session_ready(clone_backend_name)
+        self.assertIsNotNone(
+            clone_session,
+            "Cloned metro volume '%s' should have an active metro "
+            "replication session on PowerStore." % clone_backend_name)
+        LOG.info("Metro volume %s cloned to %s; session '%s' confirmed.",
+                 source_vol['id'], cloned['id'], clone_session)
+
+    # ==================================================================
+    # Test: create volume from snapshot of metro volume, larger size
+    # ==================================================================
+    @decorators.idempotent_id('a4b5c6d7-1234-5678-abcd-000000000002')
+    def test_create_volume_from_snapshot_metro_with_extend(self):
+        """Create a metro volume from a snapshot with size > source size.
+
+        This exercises the clone -> extend -> configure metro sequence
+        that the Gerrit reviewer requested be covered (volume.size >
+        source_size on a metro clone).
+        """
+
+        LOG.info("=== test_create_volume_from_snapshot_metro_with_extend ===")
+        vt = self._create_metro_volume_type()
+        source_vol = self._create_volume(vt['name'], size=1)
+        source_backend_name = "volume-%s" % source_vol['id']
+        self._wait_for_metro_session_ready(source_backend_name)
+        snap = self._create_snapshot(source_vol['id'])
+
+        # Create a new volume from the snapshot, but larger than source
+        larger = self.vols.create_volume(
+            name=data_utils.rand_name(
+                prefix=CONF.resource_name_prefix,
+                name='ps-metro-snap-larger'),
+            size=2,
+            volume_type=vt['name'],
+            snapshot_id=snap['id'],
+        )['volume']
+        self.addCleanup(self._delete_volume_safe, larger['id'])
+        larger_info = self._wait_for_volume_status(
+            larger['id'], 'available', timeout=180)
+
+        self.assertEqual(
+            2, larger_info.get('size'),
+            "Larger metro volume should have size=2, got '%s'"
+            % larger_info.get('size'))
+        self.assertEqual(
+            'enabled', larger_info.get('replication_status'),
+            "Larger metro volume from snapshot should have "
+            "replication_status='enabled', got '%s'"
+            % larger_info.get('replication_status'))
+
+        larger_backend_name = "volume-%s" % larger['id']
+        larger_session = self._wait_for_metro_session_ready(
+            larger_backend_name)
+        self.assertIsNotNone(
+            larger_session,
+            "Larger metro volume '%s' should have an active metro "
+            "replication session on PowerStore." % larger_backend_name)
+
+        # Backend verification: PowerStore volume size should be 2 GiB
+        ps_larger = self._ps_get_volume_by_name(larger_backend_name)
+        self.assertIsNotNone(
+            ps_larger,
+            "PowerStore volume '%s' should exist." % larger_backend_name)
+        expected_size_bytes = 2 * 1024 * 1024 * 1024
+        self.assertEqual(
+            expected_size_bytes, ps_larger.get('size'),
+            "PowerStore volume size should be %s bytes for 2 GiB, "
+            "got %s" % (expected_size_bytes, ps_larger.get('size')))
+        LOG.info("Metro volume %s (2 GiB) created from snapshot %s; "
+                 "session '%s' confirmed, size=%s bytes.",
+                 larger['id'], snap['id'], larger_session,
+                 ps_larger.get('size'))
