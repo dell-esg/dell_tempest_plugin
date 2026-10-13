@@ -190,7 +190,8 @@ class PowerStoreVolumeManageUnmanageBase(object):
         name = data_utils.rand_name(
             prefix=CONF.resource_name_prefix,
             name='ps-manage-type')
-        specs = {'volume_backend_name': 'powerstore'}
+        backend_name = self.powerstore_host.split('@', 1)[-1].split('#', 1)[0]
+        specs = {'volume_backend_name': backend_name}
         if extra_specs:
             specs.update(extra_specs)
         vt = self.vtypes.create_volume_type(
@@ -387,15 +388,16 @@ class PowerStoreVolumeManageUnmanageBase(object):
     def _get_powerstore_volume_id_by_name(self, backend_name):
         """Query the PowerStore REST API to get a volume UUID by name.
 
-        Reads PowerStore credentials from cinder.conf [powerstore] section.
+        Reads PowerStore credentials from the configured backend section.
         Returns the PowerStore volume UUID string, or None if not found.
         """
         try:
             conf = configparser.ConfigParser()
             conf.read('/etc/cinder/cinder.conf')
-            ps_ip = conf.get('powerstore', 'san_ip')
-            ps_user = conf.get('powerstore', 'san_login')
-            ps_pass = conf.get('powerstore', 'san_password')
+            backend = self.powerstore_host.split('@', 1)[-1].split('#', 1)[0]
+            ps_ip = conf.get(backend, 'san_ip')
+            ps_user = conf.get(backend, 'san_login')
+            ps_pass = conf.get(backend, 'san_password')
         except Exception as e:
             LOG.warning("Cannot read PowerStore creds from cinder.conf: %s", e)
             return None
