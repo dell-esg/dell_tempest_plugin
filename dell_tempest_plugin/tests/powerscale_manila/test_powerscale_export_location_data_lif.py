@@ -174,6 +174,69 @@ class PowerScaleExportLocationTest(dedupe_tests.PowerScaleDedupeShareTest):
         paths, locations = self._get_paths_and_locations(share['id'])
         return share, paths, locations
 
+    def _wait_for_snapshot(self, snapshot_id):
+        """Wait for a snapshot to become available."""
+        deadline = time.time() + SHARE_BUILD_TIMEOUT
+        while time.time() < deadline:
+            snapshot = self.shares_v2_client.get_snapshot(snapshot_id)
+            snapshot = snapshot.get('snapshot', snapshot)
+            status = snapshot.get('status', '').lower()
+            if status == 'available':
+                return
+            if status in ('error', 'error_deleting'):
+                self.fail(
+                    'Snapshot %s entered error state: %s' %
+                    (snapshot_id, status))
+            time.sleep(SHARE_BUILD_INTERVAL)
+        self.fail('Timeout waiting for snapshot %s' % snapshot_id)
+
+    def _delete_snapshot_safe(self, snapshot_id):
+        """Delete a snapshot and wait for it to disappear."""
+        try:
+            self.shares_v2_client.delete_snapshot(snapshot_id)
+        except lib_exc.NotFound:
+            return
+        deadline = time.time() + SHARE_BUILD_TIMEOUT
+        while time.time() < deadline:
+            try:
+                self.shares_v2_client.get_snapshot(snapshot_id)
+            except lib_exc.NotFound:
+                return
+            time.sleep(SHARE_BUILD_INTERVAL)
+        self.fail('Timeout deleting snapshot %s' % snapshot_id)
+
+    def _create_from_snapshot_and_get(self, protocol, size=10):
+        """Create a share from a snapshot and return its locations."""
+        share_type = self.create_share_type(extra_specs={
+            'snapshot_support': 'True',
+            'create_share_from_snapshot_support': 'True',
+        })
+        source = self.create_share(
+            protocol=protocol,
+            share_type_name=share_type['name'],
+            size=size,
+        )
+        snapshot = self.shares_v2_client.create_snapshot(
+            share_id=source['id'],
+            name=data_utils.rand_name('ps-export-lif-snapshot'))
+        snapshot = snapshot.get('snapshot', snapshot)
+        self.addCleanup(self._delete_snapshot_safe, snapshot['id'])
+        self._wait_for_snapshot(snapshot['id'])
+
+        destination = self.shares_v2_client.create_share(
+            share_protocol=protocol,
+            size=size,
+            name=data_utils.rand_name(
+                'ps-export-lif-from-snapshot-%s' % protocol.lower()),
+            snapshot_id=snapshot['id'],
+            share_type_id=share_type['id'],
+        )
+        destination = destination.get('share', destination)
+        self.addCleanup(self._delete_share_safe, destination['id'])
+        self._wait_for_share_status(destination['id'], 'available')
+        paths, locations = self._get_paths_and_locations(destination['id'])
+        return paths, locations
+
 
 # ===================================================================
 # NFS Export Location Tests
@@ -286,6 +349,16 @@ class _NFSExportLocationTests(object):
 
         LOG.info("NFS share %s accessible through all %d data LIFs",
                  share_id, len(addresses))
+
+    @decorators.idempotent_id('c1d2e3f4-a5b6-7890-cdef-012345678905')
+    @decorators.attr(type=['positive', 'api_with_backend'])
+    def test_nfs_snapshot_share_export_locations_are_data_lifs(self):
+        """Verify NFS shares created from snapshots use every data LIF."""
+        paths, locations = self._create_from_snapshot_and_get('NFS')
+        addresses, directories = self._parse_nfs_paths(paths)
+        self.assertEqual(len(addresses), len(set(addresses)))
+        self.assertEqual(1, len(directories))
+        self._assert_exactly_one_preferred(locations)
 
     # ----------------------------------------------------------------
     # Test 4: NFS full lifecycle with data-LIF verification
@@ -428,6 +501,16 @@ class _CIFSExportLocationTests(object):
         self._assert_exactly_one_preferred(locations_after)
 
         LOG.info("CIFS share %s: exports preserved after extend", share_id)
+
+    @decorators.idempotent_id('d1e2f3a4-b5c6-7890-defa-012345678904')
+    @decorators.attr(type=['positive', 'api_with_backend'])
+    def test_cifs_snapshot_share_export_locations_are_data_lifs(self):
+        """Verify CIFS shares created from snapshots use every data LIF."""
+        paths, locations = self._create_from_snapshot_and_get('CIFS')
+        addresses, share_names = self._parse_cifs_paths(paths)
+        self.assertEqual(len(addresses), len(set(addresses)))
+        self.assertEqual(1, len(share_names))
+        self._assert_exactly_one_preferred(locations)
 
     # ----------------------------------------------------------------
     # Test 3: CIFS full lifecycle with data-LIF verification
