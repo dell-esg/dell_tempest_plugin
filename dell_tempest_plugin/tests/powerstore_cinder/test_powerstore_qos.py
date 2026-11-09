@@ -108,6 +108,77 @@ class PowerStoreQoSBase(object):
 
     BACKEND_NAME = 'powerstore1'
 
+    # Objects created by *this* process (each stestr worker is its own
+    # process, so parallel workers never sweep each other's objects).
+    _created = {'volumes': [], 'types': [], 'qos': [], 'hosts': []}
+
+    @classmethod
+    def resource_cleanup(cls):
+        try:
+            cls._sweep_leftovers()
+        finally:
+            super(PowerStoreQoSBase, cls).resource_cleanup()
+
+    @classmethod
+    def _sweep_leftovers(cls):
+        """Safety net: remove anything this process created that survived.
+
+        Per-test addCleanup handlers normally remove everything; this only
+        matters after a failed/aborted cleanup. Only ids recorded by this
+        process are touched.
+        """
+        reg = cls._created
+        vols = cls.os_admin.volumes_client_latest
+        for vol_id in reg['volumes']:
+            try:
+                vols.delete_volume(vol_id)
+                vols.wait_for_resource_deletion(vol_id)
+            except lib_exc.NotFound:
+                pass
+            except Exception as e:
+                LOG.warning("sweep: volume %s: %s", vol_id, e)
+        types = cls.os_admin.volume_types_client_latest
+        for type_id in reg['types']:
+            try:
+                types.delete_volume_type(type_id)
+            except lib_exc.NotFound:
+                pass
+            except Exception as e:
+                LOG.warning("sweep: volume type %s: %s", type_id, e)
+        qos = cls.os_admin.volume_qos_client_latest
+        for qos_id in reg['qos']:
+            try:
+                qos.delete_qos(qos_id, force=True)
+            except lib_exc.NotFound:
+                pass
+            except Exception as e:
+                LOG.warning("sweep: qos %s: %s", qos_id, e)
+        ps_ip, ps_user, ps_pass = cls._read_powerstore_credentials()
+        if not ps_ip:
+            return
+
+        def _ps(method, path, **kw):
+            return requests.request(
+                method, 'https://%s/api/rest%s' % (ps_ip, path),
+                auth=(ps_user, ps_pass), verify=False, timeout=60, **kw)
+
+        def _delete_by_name(kind, name):
+            r = _ps('GET', kind, params={'name': 'eq.%s' % name,
+                                         'select': 'id'})
+            if r.status_code == 200 and r.json():
+                _ps('DELETE', '%s/%s' % (kind, r.json()[0]['id']))
+
+        try:
+            for qos_id in reg['qos']:
+                _delete_by_name('/policy', 'qos-policy-%s' % qos_id)
+                _delete_by_name('/io_limit_rule', 'io-rule-%s' % qos_id)
+            for host in reg['hosts']:
+                _delete_by_name('/host', '%s-iSCSI' % host)
+        except Exception as e:
+            LOG.warning("sweep: PowerStore cleanup failed: %s", e)
+        for key in reg:
+            del reg[key][:]
+
     # ------------------------------------------------------------------
     # Setup / discovery
     # ------------------------------------------------------------------
@@ -134,10 +205,11 @@ class PowerStoreQoSBase(object):
             self.skipTest("QoS tests build an iSCSI connector; backend "
                           "protocol is %s." % self._backend_protocol())
 
-    def _read_powerstore_credentials(self):
+    @classmethod
+    def _read_powerstore_credentials(cls):
         conf = configparser.ConfigParser(interpolation=None)
         conf.read('/etc/cinder/cinder.conf')
-        for section in (self.BACKEND_NAME, 'backend_defaults'):
+        for section in (cls.BACKEND_NAME, 'backend_defaults'):
             try:
                 return (conf.get(section, 'san_ip'),
                         conf.get(section, 'san_login'),
@@ -252,8 +324,13 @@ class PowerStoreQoSBase(object):
         try:
             host = self._ps_first('/host', {
                 'name': 'eq.%s-iSCSI' % host_name, 'select': 'id,name'})
-            if host:
-                self._ps('DELETE', '/host/%s' % host['id'])
+            for _ in range(5):
+                if not host:
+                    break
+                r = self._ps('DELETE', '/host/%s' % host['id'])
+                if r.status_code in (200, 204, 404):
+                    break
+                time.sleep(2)
         except Exception as e:
             LOG.warning("PowerStore host cleanup for %s failed: %s",
                         host_name, e)
@@ -271,6 +348,7 @@ class PowerStoreQoSBase(object):
         specs = {k: str(v) for k, v in specs.items()}
         q = self.qos.create_qos(name=name, consumer=consumer,
                                 **specs)['qos_specs']
+        self._created['qos'].append(q['id'])
         self.addCleanup(self._delete_qos_safe, q['id'])
         self.addCleanup(self._ps_cleanup_qos_objects, q['id'])
         return q
@@ -293,6 +371,7 @@ class PowerStoreQoSBase(object):
                                       name=name),
             extra_specs={'volume_backend_name': self.BACKEND_NAME}
         )['volume_type']
+        self._created['types'].append(vt['id'])
         self.addCleanup(self._delete_volume_type_safe, vt['id'])
         if qos:
             self.qos.associate_qos(qos['id'], vt['id'])
@@ -323,6 +402,7 @@ class PowerStoreQoSBase(object):
             name=data_utils.rand_name(prefix=CONF.resource_name_prefix,
                                       name='ps-qos-vol'),
             size=size, volume_type=vt['name'], **kwargs)['volume']
+        self._created['volumes'].append(vol['id'])
         self.addCleanup(self._delete_volume_safe, vol['id'])
         waiters.wait_for_volume_resource_status(
             self.vols, vol['id'], 'available')
@@ -364,6 +444,7 @@ class PowerStoreQoSBase(object):
     def _new_connector(self):
         suffix = uuid.uuid4().hex[:12]
         host = 'tempest-psqos-%s' % suffix
+        self._created['hosts'].append(host)
         self.addCleanup(self._ps_cleanup_host, host)
         return {
             'host': host,
